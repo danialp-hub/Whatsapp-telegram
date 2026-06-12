@@ -1,6 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
@@ -11,49 +12,64 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
-const LEADS_FILE = "leads.json";
+const LEADS_FILE = path.join(__dirname, "leads.json");
+
+function readLeads() {
+  try {
+    if (!fs.existsSync(LEADS_FILE)) {
+      fs.writeFileSync(LEADS_FILE, JSON.stringify([], null, 2));
+    }
+
+    const data = fs.readFileSync(LEADS_FILE, "utf8");
+    return JSON.parse(data || "[]");
+  } catch (error) {
+    console.error("Read leads error:", error.message);
+    return [];
+  }
+}
 
 function saveLead(phone, message) {
-  let leads = [];
+  try {
+    const leads = readLeads();
 
-  if (fs.existsSync(LEADS_FILE)) {
-    try {
-      leads = JSON.parse(fs.readFileSync(LEADS_FILE, "utf8"));
-    } catch {
-      leads = [];
-    }
+    leads.push({
+      phone,
+      message,
+      date: new Date().toISOString(),
+    });
+
+    fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2));
+
+    console.log("Lead saved:", phone, message);
+  } catch (error) {
+    console.error("Save lead error:", error.message);
   }
-
-  leads.push({
-    phone,
-    message,
-    date: new Date().toISOString(),
-  });
-
-  fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2));
 }
 
 function getLeadsText() {
-  if (!fs.existsSync(LEADS_FILE)) return "No leads saved yet.";
+  const leads = readLeads();
 
-  const leads = JSON.parse(fs.readFileSync(LEADS_FILE, "utf8"));
+  if (!leads || leads.length === 0) {
+    return "No leads saved yet.";
+  }
+
   const lastLeads = leads.slice(-20).reverse();
-
-  if (lastLeads.length === 0) return "No leads saved yet.";
 
   return (
     `📋 Last ${lastLeads.length} Leads:\n\n` +
     lastLeads
-      .map(
-        (lead, index) =>
-          `${index + 1}. ${lead.phone}\n💬 ${lead.message}\n🕒 ${lead.date}`
-      )
+      .map((lead, index) => {
+        return `${index + 1}. ${lead.phone}\n💬 ${lead.message}\n🕒 ${lead.date}`;
+      })
       .join("\n\n")
   );
 }
 
 async function sendTelegram(text) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("Telegram variables not configured");
+    return;
+  }
 
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     chat_id: TELEGRAM_CHAT_ID,
@@ -62,13 +78,19 @@ async function sendTelegram(text) {
 }
 
 async function sendWhatsAppText(to, text) {
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+    throw new Error("WhatsApp variables not configured");
+  }
+
   await axios.post(
     `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
     {
       messaging_product: "whatsapp",
       to,
       type: "text",
-      text: { body: text },
+      text: {
+        body: text,
+      },
     },
     {
       headers: {
@@ -88,19 +110,46 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
+  console.log("Webhook verification request received");
+
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("Webhook verified successfully");
     return res.status(200).send(challenge);
   }
 
+  console.log("Webhook verification failed");
   return res.sendStatus(403);
 });
 
 app.post("/telegram", async (req, res) => {
   try {
+    console.log("Telegram webhook:", JSON.stringify(req.body));
+
     const message = req.body?.message;
     const text = message?.text || "";
 
-    if (!text) return res.sendStatus(200);
+    if (!text) {
+      return res.sendStatus(200);
+    }
+
+    console.log("Telegram message received:", text);
+
+    if (text === "/start") {
+      await sendTelegram(
+        `ALMA DXB Bot is active ✅
+
+Commands:
+/leads
+/send 971501234567 Your message here`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    if (text === "/leads") {
+      await sendTelegram(getLeadsText());
+      return res.sendStatus(200);
+    }
 
     if (text.startsWith("/send ")) {
       const parts = text.split(" ");
@@ -115,17 +164,25 @@ app.post("/telegram", async (req, res) => {
       }
 
       await sendWhatsAppText(phone, replyText);
+
       await sendTelegram(`✅ Sent to WhatsApp:\n${phone}\n\n${replyText}`);
+
+      console.log("Telegram reply sent to WhatsApp:", phone);
+      return res.sendStatus(200);
     }
 
-    if (text === "/leads") {
-      await sendTelegram(getLeadsText());
-    }
+    await sendTelegram(
+      `Unknown command.
 
-    res.sendStatus(200);
+Use:
+/leads
+/send 971501234567 Your message here`
+    );
+
+    return res.sendStatus(200);
   } catch (error) {
     console.error("Telegram Error:", error.response?.data || error.message);
-    res.sendStatus(500);
+    return res.sendStatus(500);
   }
 });
 
@@ -136,25 +193,28 @@ app.post("/webhook", async (req, res) => {
     const value = req.body?.entry?.[0]?.changes?.[0]?.value;
     const message = value?.messages?.[0];
 
-    if (message) {
-      const from = message.from;
-      const text = message.text?.body || "[Non-text message]";
+    if (!message) {
+      return res.sendStatus(200);
+    }
 
-      console.log(`Message from ${from}: ${text}`);
+    const from = message.from;
+    const text = message.text?.body || "[Non-text message]";
 
-      saveLead(from, text);
+    console.log(`Message from ${from}: ${text}`);
 
-      await sendTelegram(`📱 WhatsApp Message\n\n👤 From: ${from}\n💬 ${text}`);
+    saveLead(from, text);
 
-      const lowerText = text.toLowerCase();
+    await sendTelegram(`📱 WhatsApp Message\n\n👤 From: ${from}\n💬 ${text}`);
 
-      if (
-        lowerText.includes("catalog") ||
-        lowerText.includes("list") ||
-        lowerText.includes("price") ||
-        lowerText.includes("offer")
-      ) {
-        const catalog1 = `📢 ALMA DXB – JUNE 2026 CATALOG
+    const lowerText = text.toLowerCase();
+
+    if (
+      lowerText.includes("catalog") ||
+      lowerText.includes("list") ||
+      lowerText.includes("price") ||
+      lowerText.includes("offer")
+    ) {
+      const catalog1 = `📢 ALMA DXB – JUNE 2026 CATALOG
 
 ⌚ Redmi & Xiaomi
 • Redmi Buds 8 Active – 58 AED
@@ -187,7 +247,7 @@ app.post("/webhook", async (req, res) => {
 • Pura ELE – 80 AED
 • Earbuds Open – 65 AED`;
 
-        const catalog2 = `⌚ Haylou
+      const catalog2 = `⌚ Haylou
 • Watch S6 – 60 AED
 • Solar 5 – 140 AED
 • Solar Ultra – 150 AED
@@ -213,7 +273,7 @@ Huawei Audio
 • FreeBuds SE 4 NC – 148 AED
 • FreeBuds Pro 5 – 505 AED`;
 
-        const catalog3 = `⌚ Samsung
+      const catalog3 = `⌚ Samsung
 • Galaxy Watch 8 (44mm) Silver – 680 AED
 • Galaxy Watch 8 Classic – From 760 AED
 • Galaxy Watch Ultra 2025 – From 1050 AED
@@ -235,7 +295,7 @@ Samsung Audio
 • Ear A – 160 AED
 • Ear Open – 315 AED`;
 
-        const catalog4 = `🔊 JBL Speakers
+      const catalog4 = `🔊 JBL Speakers
 • Go 5 – 149 AED
 • Clip 5 – 199 AED
 • Flip 7 – 270 AED
@@ -258,7 +318,7 @@ PartyBox Series
 • Aura Studio 5 – 740 AED
 • SoundSticks 5 – 950 AED`;
 
-        const catalog5 = `🎧 JBL Headphones
+      const catalog5 = `🎧 JBL Headphones
 • Tune 305 – 39.5 AED
 • Tune 310 – 39.5 AED
 • Tune 530 – 97 AED
@@ -281,19 +341,19 @@ PartyBox Series
 📍 ALMA DXB
 📲 WhatsApp: +971 55 140 0474`;
 
-        await sendWhatsAppText(from, catalog1);
-        await sendWhatsAppText(from, catalog2);
-        await sendWhatsAppText(from, catalog3);
-        await sendWhatsAppText(from, catalog4);
-        await sendWhatsAppText(from, catalog5);
+      await sendWhatsAppText(from, catalog1);
+      await sendWhatsAppText(from, catalog2);
+      await sendWhatsAppText(from, catalog3);
+      await sendWhatsAppText(from, catalog4);
+      await sendWhatsAppText(from, catalog5);
 
-        console.log("Catalog sent to WhatsApp");
-      } else if (
-        lowerText.includes("hi") ||
-        lowerText.includes("hello") ||
-        lowerText.includes("سلام")
-      ) {
-        const reply = `Hello 👋
+      console.log("Catalog sent to WhatsApp:", from);
+    } else if (
+      lowerText.includes("hi") ||
+      lowerText.includes("hello") ||
+      lowerText.includes("سلام")
+    ) {
+      const reply = `Hello 👋
 
 Thank you for contacting ALMA DXB.
 
@@ -304,15 +364,15 @@ CATALOG
 📍 ALMA DXB
 📲 WhatsApp: +971 55 140 0474`;
 
-        await sendWhatsAppText(from, reply);
-        console.log("Welcome reply sent to WhatsApp");
-      }
+      await sendWhatsAppText(from, reply);
+
+      console.log("Welcome reply sent to WhatsApp:", from);
     }
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (error) {
     console.error("Webhook Error:", error.response?.data || error.message);
-    res.sendStatus(500);
+    return res.sendStatus(500);
   }
 });
 
