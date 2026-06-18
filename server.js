@@ -19,9 +19,7 @@ function readLeads() {
     if (!fs.existsSync(LEADS_FILE)) {
       fs.writeFileSync(LEADS_FILE, JSON.stringify([], null, 2));
     }
-
-    const data = fs.readFileSync(LEADS_FILE, "utf8");
-    return JSON.parse(data || "[]");
+    return JSON.parse(fs.readFileSync(LEADS_FILE, "utf8") || "[]");
   } catch (error) {
     console.error("Read leads error:", error.message);
     return [];
@@ -31,15 +29,12 @@ function readLeads() {
 function saveLead(phone, message) {
   try {
     const leads = readLeads();
-
     leads.push({
       phone,
       message,
       date: new Date().toISOString(),
     });
-
     fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2));
-
     console.log("Lead saved:", phone, message);
   } catch (error) {
     console.error("Save lead error:", error.message);
@@ -66,10 +61,7 @@ function getLeadsText() {
 }
 
 async function sendTelegram(text) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.log("Telegram variables not configured");
-    return;
-  }
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
 
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     chat_id: TELEGRAM_CHAT_ID,
@@ -78,19 +70,13 @@ async function sendTelegram(text) {
 }
 
 async function sendWhatsAppText(to, text) {
-  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
-    throw new Error("WhatsApp variables not configured");
-  }
-
   await axios.post(
     `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
     {
       messaging_product: "whatsapp",
       to,
       type: "text",
-      text: {
-        body: text,
-      },
+      text: { body: text },
     },
     {
       headers: {
@@ -99,6 +85,18 @@ async function sendWhatsAppText(to, text) {
       },
     }
   );
+}
+
+function extractPhoneFromTelegramMessage(text) {
+  if (!text) return null;
+
+  const match = text.match(/From:\s*(\d+)/i);
+  if (match && match[1]) return match[1];
+
+  const fallback = text.match(/\b\d{8,15}\b/);
+  if (fallback && fallback[0]) return fallback[0];
+
+  return null;
 }
 
 app.get("/", (req, res) => {
@@ -110,14 +108,10 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  console.log("Webhook verification request received");
-
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook verified successfully");
     return res.status(200).send(challenge);
   }
 
-  console.log("Webhook verification failed");
   return res.sendStatus(403);
 });
 
@@ -128,11 +122,25 @@ app.post("/telegram", async (req, res) => {
     const message = req.body?.message;
     const text = message?.text || "";
 
-    if (!text) {
+    if (!message || !text) {
       return res.sendStatus(200);
     }
 
     console.log("Telegram message received:", text);
+
+    if (message.reply_to_message && !text.startsWith("/")) {
+      const originalText = message.reply_to_message.text || "";
+      const phone = extractPhoneFromTelegramMessage(originalText);
+
+      if (!phone) {
+        await sendTelegram("❌ Could not find customer phone number in replied message.");
+        return res.sendStatus(200);
+      }
+
+      await sendWhatsAppText(phone, text);
+      await sendTelegram(`✅ Reply sent to WhatsApp:\n${phone}\n\n${text}`);
+      return res.sendStatus(200);
+    }
 
     if (text === "/start") {
       await sendTelegram(
@@ -140,9 +148,11 @@ app.post("/telegram", async (req, res) => {
 
 Commands:
 /leads
-/send 971501234567 Your message here`
-      );
+/send 971501234567 Your message here
 
+New:
+Reply to any WhatsApp customer message in Telegram and type your answer.`
+      );
       return res.sendStatus(200);
     }
 
@@ -157,17 +167,12 @@ Commands:
       const replyText = parts.slice(2).join(" ");
 
       if (!phone || !replyText) {
-        await sendTelegram(
-          "❌ Wrong format.\n\nUse:\n/send 971501234567 Your message here"
-        );
+        await sendTelegram("❌ Wrong format.\n\nUse:\n/send 971501234567 Your message here");
         return res.sendStatus(200);
       }
 
       await sendWhatsAppText(phone, replyText);
-
       await sendTelegram(`✅ Sent to WhatsApp:\n${phone}\n\n${replyText}`);
-
-      console.log("Telegram reply sent to WhatsApp:", phone);
       return res.sendStatus(200);
     }
 
@@ -176,7 +181,9 @@ Commands:
 
 Use:
 /leads
-/send 971501234567 Your message here`
+/send 971501234567 Your message here
+
+Or reply directly to a customer message.`
     );
 
     return res.sendStatus(200);
@@ -365,7 +372,6 @@ CATALOG
 📲 WhatsApp: +971 55 140 0474`;
 
       await sendWhatsAppText(from, reply);
-
       console.log("Welcome reply sent to WhatsApp:", from);
     }
 
